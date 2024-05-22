@@ -1,0 +1,381 @@
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Data.SQLite;
+using System.Text;
+using System.Collections.Generic;
+
+public class BackendServer
+{
+    private IPAddress localIpAddress = IPAddress.Parse("127.0.0.1"); // Loopback address
+    private int port = 3000; // Change this to your desired port
+    private SQLiteConnection dbConnection;
+    private int loggedInPlayerCount = 0;
+
+    /*
+    private static string[] EliteSystemNames = {
+        // (list of system names)
+        "Sol", "Alpha Centauri", "Barnard's Star", "Sirius", "Procyon", // Add more systems as needed
+    };
+    */
+
+    public BackendServer()
+    {
+        DisplayBackendStatus();
+        dbConnection = new SQLiteConnection("Data Source=eoc.db;Version=3;");
+        dbConnection.Open();
+        //InitializeDatabase();
+    }
+
+    public void Start()
+    {
+        TcpListener listener = new TcpListener(localIpAddress, port);
+        listener.Start();
+        Console.WriteLine("Server started. Waiting for connections...");
+
+        while (true)
+        {
+            TcpClient client = listener.AcceptTcpClient();
+            Console.WriteLine("Client connected.");
+            HandleClient(client);
+        }
+    }
+
+ /*   private void InitializeDatabase()
+    {
+        using (SQLiteCommand command = new SQLiteCommand(dbConnection))
+        {
+            command.CommandText = "CREATE TABLE IF NOT EXISTS Players (Username TEXT PRIMARY KEY, Password TEXT, CurrentSystemId TEXT)";
+            command.ExecuteNonQuery();
+
+            command.CommandText = "CREATE TABLE IF NOT EXISTS Systems (Id INTEGER PRIMARY KEY AUTOINCREMENT, Name TEXT)";
+            command.ExecuteNonQuery();
+
+            command.CommandText = "CREATE TABLE IF NOT EXISTS GameWorld (Id INTEGER PRIMARY KEY AUTOINCREMENT, SystemId INTEGER, ConnectedSystemId INTEGER)";
+            command.ExecuteNonQuery();
+        }
+
+        // PopulateGameWorld();
+    }
+ */
+
+    /*
+    private void PopulateGameWorld()
+    {
+        using (SQLiteTransaction transaction = dbConnection.BeginTransaction())
+        {
+            using (SQLiteCommand command = new SQLiteCommand(dbConnection))
+            {
+                foreach (var systemName in EliteSystemNames)
+                {
+                    command.CommandText = "INSERT OR IGNORE INTO Systems (Name) VALUES (@Name)";
+                    command.Parameters.AddWithValue("@Name", systemName);
+                    command.ExecuteNonQuery();
+                }
+
+                // Add connections between systems
+                AddGameWorldConnection("Sol", "Alpha Centauri");
+                AddGameWorldConnection("Sol", "Barnard's Star");
+                // Add more connections as needed
+            }
+            transaction.Commit();
+        }
+    }
+
+    */
+
+    private void AddGameWorldConnection(string system1, string system2)
+    {
+        int systemId1 = GetSystemId(system1);
+        int systemId2 = GetSystemId(system2);
+
+        if (systemId1 != -1 && systemId2 != -1)
+        {
+            using (SQLiteCommand command = new SQLiteCommand(dbConnection))
+            {
+                command.CommandText = "INSERT OR IGNORE INTO GameWorld (SystemId, ConnectedSystemId) VALUES (@SystemId1, @SystemId2)";
+                command.Parameters.AddWithValue("@SystemId1", systemId1);
+                command.Parameters.AddWithValue("@SystemId2", systemId2);
+                command.ExecuteNonQuery();
+
+                command.CommandText = "INSERT OR IGNORE INTO GameWorld (SystemId, ConnectedSystemId) VALUES (@SystemId2, @SystemId1)";
+                command.Parameters.AddWithValue("@SystemId1", systemId2);
+                command.Parameters.AddWithValue("@SystemId2", systemId1);
+                command.ExecuteNonQuery();
+            }
+        }
+    }
+
+    private int GetSystemId(string systemName)
+    {
+        using (SQLiteCommand command = new SQLiteCommand("SELECT Id FROM Systems2 WHERE Name = @Name", dbConnection))
+        {
+            command.Parameters.AddWithValue("@Name", systemName);
+            var result = command.ExecuteScalar();
+            return result != null ? Convert.ToInt32(result) : -1;
+        }
+    }
+
+    private bool SystemExists(string systemName)
+    {
+        using (SQLiteCommand command = new SQLiteCommand("SELECT COUNT(*) FROM Systems2 WHERE Name = @Name", dbConnection))
+        {
+            command.Parameters.AddWithValue("@Name", systemName);
+            int count = Convert.ToInt32(command.ExecuteScalar());
+            return count > 0;
+        }
+    }
+
+    private void HandleClient(TcpClient client)
+    {
+        NetworkStream stream = client.GetStream();
+        byte[] buffer = new byte[1024];
+        int bytesRead = stream.Read(buffer, 0, buffer.Length);
+        string request = Encoding.ASCII.GetString(buffer, 0, bytesRead);
+
+        string[] parts = request.Split('|');
+        string response = "";
+
+        switch (parts[0])
+        {
+            case "REGISTER":
+                string username = parts[1];
+                string password = parts[2];
+                bool success = RegisterPlayer(username, password);
+                response = success ? "Registration successful." : "Registration failed. Username may already be taken.";
+                if (success)
+                {
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine($"{GetCurrentTimestamp()} Player registered: {username}");
+                    Console.ResetColor();
+                }
+                else
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"{GetCurrentTimestamp()} Registration failed for: {username}");
+                    Console.ResetColor();
+                }
+                break;
+
+            case "LOGIN":
+                username = parts[1];
+                password = parts[2];
+                success = LoginPlayer(username, password);
+                response = success ? "LOGIN_SUCCESS" : "LOGIN_FAILED";
+                if (success)
+                {
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine($"{GetCurrentTimestamp()} Player logged in: {username}");
+                    Console.ResetColor();
+                }
+                else
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"{GetCurrentTimestamp()} Login failed for: {username}");
+                    Console.ResetColor();
+                }
+                break;
+
+            case "LOGOUT":
+                username = parts[1];
+                LogoutPlayer(username);
+                response = "LOGOUT_SUCCESS";
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"{GetCurrentTimestamp()} Player logged out: {username}");
+                Console.ResetColor();
+                break;
+
+            case "GET_CONNECTED_SYSTEMS":
+                string currentSystem = parts[1];
+                response = GetConnectedSystems(currentSystem);
+                //Console.WriteLine("Connected systems - response:", response);
+
+                Console.ForegroundColor = ConsoleColor.Blue;
+                Console.WriteLine($"{GetCurrentTimestamp()} Connected systems for {currentSystem} requested:\n{response}");
+                Console.ResetColor();
+                break;
+
+            case "TRAVEL":
+                username = parts[1];
+                string destinationSystem = parts[2];
+                success = Travel(username, destinationSystem);
+                response = success ? "TRAVEL_SUCCESS" : "TRAVEL_FAILED";
+                if (success)
+                {
+                    Console.ForegroundColor = ConsoleColor.Cyan;
+                    Console.WriteLine($"{GetCurrentTimestamp()} Player {username} traveled to {destinationSystem}");
+                    Console.ResetColor();
+                }
+                else
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"{GetCurrentTimestamp()} Travel failed for player {username} to {destinationSystem}");
+                    Console.ResetColor();
+                }
+                break;
+
+            case "GET_CURRENT_SYSTEM":
+                username = parts[1];
+                response = GetCurrentSystem(username);
+                Console.ForegroundColor = ConsoleColor.Blue;
+                Console.WriteLine($"{GetCurrentTimestamp()} Current system for player {username} requested: {response}");
+                Console.ResetColor();
+                break;
+
+            default:
+                response = "UNKNOWN_COMMAND";
+                Console.ForegroundColor = ConsoleColor.Magenta;
+                Console.WriteLine($"{GetCurrentTimestamp()} Unknown command received.");
+                Console.ResetColor();
+                break;
+        }
+
+        byte[] responseData = Encoding.ASCII.GetBytes(response);
+        stream.Write(responseData, 0, responseData.Length);
+
+        stream.Close();
+        client.Close();
+    }
+
+    private bool RegisterPlayer(string username, string password)
+    {
+        using (SQLiteCommand command = new SQLiteCommand("INSERT INTO Players (Username, Password, CurrentSystemId) VALUES (@Username, @Password, '1')", dbConnection))
+        {
+            command.Parameters.AddWithValue("@Username", username);
+            command.Parameters.AddWithValue("@Password", password);
+            try
+            {
+                command.ExecuteNonQuery();
+                return true;
+            }
+            catch (SQLiteException)
+            {
+                return false;
+            }
+        }
+    }
+
+    private bool LoginPlayer(string username, string password)
+    {
+        using (SQLiteCommand command = new SQLiteCommand("SELECT * FROM Players WHERE Username = @Username AND Password = @Password", dbConnection))
+        {
+            command.Parameters.AddWithValue("@Username", username);
+            command.Parameters.AddWithValue("@Password", password);
+            using (SQLiteDataReader reader = command.ExecuteReader())
+            {
+                if (reader.Read())
+                {
+                    loggedInPlayerCount++;
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine($"{GetCurrentTimestamp()} Login successful for player: {username}");
+                    Console.WriteLine($"{GetCurrentTimestamp()} Number of logged-in players: {loggedInPlayerCount}");
+                    Console.ResetColor();
+                    return true;
+                }
+                else
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"{GetCurrentTimestamp()} Login failed for player: {username}");
+                    Console.ResetColor();
+                    return false;
+                }
+            }
+        }
+    }
+
+    private void LogoutPlayer(string username)
+    {
+        loggedInPlayerCount--;
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine($"{GetCurrentTimestamp()} Player logged out: {username}");
+        Console.WriteLine($"{GetCurrentTimestamp()} Number of logged-in players: {loggedInPlayerCount}");
+        Console.ResetColor();
+    }
+
+    private string GetConnectedSystems(string currentSystem)
+    {
+        int systemId = GetSystemId(currentSystem);
+        List<string> connectedSystems = new List<string>();
+
+        if (systemId != -1)
+        {
+            using (SQLiteCommand command = new SQLiteCommand
+                (
+                $@"  -- namen aller verbundenen system 
+                    SELECT  
+                            sc.Name   
+                    FROM 
+	                        Systems2 s
+                    JOIN	
+	                        GameWorld2 gw
+	                        on s.Id = gw.SystemId
+                    JOIN
+	                        Systems2 sc
+	                        on gw.ConnectedSystemId = sc.Id 
+                    WHERE 
+                            s.Id = {systemId}",
+                dbConnection)
+                )
+            {
+                command.Parameters.AddWithValue("@SystemId", systemId);
+                using (SQLiteDataReader reader = command.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        connectedSystems.Add(reader["Name"].ToString());
+                    }
+                }
+            }
+        }
+
+        return string.Join(",", connectedSystems);
+    }
+
+    private bool Travel(string username, string destinationSystem)
+    {
+        int destinationSystemId = GetSystemId(destinationSystem);
+
+        if (SystemExists(destinationSystem))
+        {
+            using (SQLiteCommand command = new SQLiteCommand("UPDATE Players SET CurrentSystemId = @CurrentSystemId WHERE Username = @Username", dbConnection))
+            {
+                command.Parameters.AddWithValue("@CurrentSystemId", destinationSystemId);
+                command.Parameters.AddWithValue("@Username", username);
+                command.ExecuteNonQuery();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private string GetCurrentSystem(string username)
+    {
+        using (SQLiteCommand command = new SQLiteCommand(
+            @"SELECT s.Name from Players p JOIN Systems2 s ON p.CurrentSystemId = s.Id WHERE Username = @Username", dbConnection))
+        {
+            command.Parameters.AddWithValue("@Username", username);
+            return command.ExecuteScalar()?.ToString() ?? "UNKNOWN";
+        }
+    }
+
+    private string GetCurrentTimestamp()
+    {
+        return DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+    }
+
+    private void DisplayBackendStatus()
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("===== EOC Backend Server ==================");
+        Console.WriteLine("Server IP: " + localIpAddress);
+        Console.WriteLine("Server Port: " + port);
+        Console.WriteLine("===========================================");
+        Console.ResetColor();
+    }
+
+    public static void Main()
+    {
+        BackendServer server = new BackendServer();
+        server.Start();
+    }
+}

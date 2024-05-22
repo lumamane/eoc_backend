@@ -1,0 +1,376 @@
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Data.SQLite;
+using System.Text;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using System.Data.Common;
+
+public class BackendServer
+{
+    private readonly IPAddress localIpAddress = IPAddress.Parse("127.0.0.1");
+    private readonly int port = 3000;
+    private readonly string httpUrl = "http://localhost:3001/";
+    private SQLiteConnection dbConnection;
+    private int loggedInPlayerCount = 0;
+    private static readonly object lockObj = new object();
+
+    public BackendServer()
+    {
+        DisplayBackendStatus();
+        InitializeDatabase();
+    }
+
+    private void InitializeDatabase()
+    {
+        try
+        {
+            dbConnection = new SQLiteConnection("Data Source=eoc.db;Version=3;");
+            dbConnection.Open();
+        }
+        catch (Exception ex)
+        {
+            Log($"Error initializing database: {ex.Message}", ConsoleColor.Red);
+            Environment.Exit(1);
+        }
+    }
+
+    public async Task Start()
+    {
+        TcpListener listener = new TcpListener(localIpAddress, port);
+        listener.Start();
+
+        HttpListener httpListener = new HttpListener();
+        httpListener.Prefixes.Add(httpUrl);
+        httpListener.Start();
+
+        Log("Server started. Waiting for connections...", ConsoleColor.Cyan);
+
+        Task tcpTask = HandleTcpClientsAsync(listener);
+        Task httpTask = HandleHttpClientsAsync(httpListener);
+
+        await Task.WhenAll(tcpTask, httpTask);
+    }
+
+    private async Task HandleTcpClientsAsync(TcpListener listener)
+    {
+        while (true)
+        {
+            TcpClient client = await listener.AcceptTcpClientAsync();
+            Log("TCP client connected.", ConsoleColor.Cyan);
+            _ = HandleClientAsync(client);
+        }
+    }
+
+    private async Task HandleHttpClientsAsync(HttpListener httpListener)
+    {
+        while (true)
+        {
+            HttpListenerContext context = await httpListener.GetContextAsync();
+            Log("HTTP client connected.", ConsoleColor.Cyan);
+            _ = HandleHttpClientAsync(context);
+        }
+    }
+
+    private async Task HandleHttpClientAsync(HttpListenerContext context)
+    {
+        HttpListenerRequest request = context.Request;
+        HttpListenerResponse response = context.Response;
+
+        if (request.HttpMethod == "OPTIONS")
+        {
+            response.AddHeader("Access-Control-Allow-Origin", "*");
+            response.AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            response.AddHeader("Access-Control-Allow-Headers", "Content-Type");
+            response.StatusCode = (int)HttpStatusCode.OK;
+            response.Close();
+            return;
+        }
+
+        string requestBody;
+        using (var reader = new System.IO.StreamReader(request.InputStream, request.ContentEncoding))
+        {
+            requestBody = await reader.ReadToEndAsync();
+        }
+
+        string[] parts = request.RawUrl.TrimStart('/').Split('/');
+        string responseString = parts.Length > 0 ? await ProcessRequest(parts, requestBody) : "UNKNOWN_COMMAND";
+
+        byte[] responseBuffer = Encoding.UTF8.GetBytes(responseString);
+
+        response.AddHeader("Access-Control-Allow-Origin", "*");
+        response.ContentType = "text/plain";
+        response.ContentEncoding = Encoding.UTF8;
+        response.ContentLength64 = responseBuffer.Length;
+
+        await response.OutputStream.WriteAsync(responseBuffer, 0, responseBuffer.Length);
+        response.Close();
+    }
+
+    private async Task HandleClientAsync(TcpClient client)
+    {
+        using (client)
+        {
+            NetworkStream stream = client.GetStream();
+            byte[] buffer = new byte[1024];
+            int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+            string request = Encoding.ASCII.GetString(buffer, 0, bytesRead);
+
+            string[] parts = request.Split('|');
+            string response = parts.Length > 0 ? await ProcessRequest(parts, null) : "UNKNOWN_COMMAND";
+
+            byte[] responseData = Encoding.ASCII.GetBytes(response);
+            await stream.WriteAsync(responseData, 0, responseData.Length);
+        }
+    }
+
+    private async Task<string> ProcessRequest(string[] parts, string requestBody)
+    {
+        string response;
+        Dictionary<string, string> parameters = requestBody != null ? ParseRequestBody(requestBody) : null;
+
+        switch (parts[0])
+        {
+            case "REGISTER":
+                response = await HandleRegister(parameters);
+                break;
+
+            case "LOGIN":
+                response = await HandleLogin(parameters);
+                break;
+
+            case "LOGOUT":
+                response = HandleLogout(parameters);
+                break;
+
+            case "GET_CONNECTED_SYSTEMS":
+                response = await HandleGetConnectedSystems(parts[1]);
+                break;
+
+            case "TRAVEL":
+                response = await HandleTravel(parameters);
+                break;
+
+            case "GET_CURRENT_SYSTEM":
+                response = await HandleGetCurrentSystem(parts[1]);
+                break;
+
+            default:
+                response = "UNKNOWN_COMMAND";
+                Log("Unknown command received.", ConsoleColor.Magenta);
+                break;
+        }
+
+        return response;
+    }
+
+    private async Task<string> HandleRegister(Dictionary<string, string> parameters)
+    {
+        if (parameters == null || !parameters.ContainsKey("username") || !parameters.ContainsKey("password"))
+            return "Invalid parameters for REGISTER";
+
+        string username = parameters["username"];
+        string password = parameters["password"];
+        bool success = await RegisterPlayer(username, password);
+        string response = success ? "Registration successful." : "Registration failed. Username may already be taken.";
+
+        Log(success ? $"Player registered: {username}" : $"Registration failed for: {username}", success ? ConsoleColor.Green : ConsoleColor.Red);
+
+        if (success)
+            await Travel(username, "Jita");
+
+        return response;
+    }
+
+    private async Task<string> HandleLogin(Dictionary<string, string> parameters)
+    {
+        if (parameters == null || !parameters.ContainsKey("username") || !parameters.ContainsKey("password"))
+            return "Invalid parameters for LOGIN";
+
+        string username = parameters["username"];
+        string password = parameters["password"];
+        bool success = await LoginPlayer(username, password);
+        string response = success ? "LOGIN_SUCCESS" : "LOGIN_FAILED";
+
+        Log(success ? $"Player logged in: {username}" : $"Login failed for: {username}", success ? ConsoleColor.Green : ConsoleColor.Red);
+
+        return response;
+    }
+
+    private string HandleLogout(Dictionary<string, string> parameters)
+    {
+        if (parameters == null || !parameters.ContainsKey("username"))
+            return "Invalid parameters for LOGOUT";
+
+        string username = parameters["username"];
+        LogoutPlayer(username);
+        Log($"Player logged out: {username}", ConsoleColor.Yellow);
+        return "LOGOUT_SUCCESS";
+    }
+
+    private async Task<string> HandleGetConnectedSystems(string currentSystem)
+    {
+        if (string.IsNullOrWhiteSpace(currentSystem))
+            return "Invalid parameters for GET_CONNECTED_SYSTEMS";
+
+        string response = await GetConnectedSystems(currentSystem);
+
+        Log($"Connected systems for {currentSystem} requested:\n{response}", ConsoleColor.Blue);
+        return response;
+    }
+
+    private async Task<string> HandleTravel(Dictionary<string, string> parameters)
+    {
+        if (parameters == null || !parameters.ContainsKey("username") || !parameters.ContainsKey("destinationSystem"))
+            return "Invalid parameters for TRAVEL";
+
+        string username = parameters["username"];
+        string destinationSystem = parameters["destinationSystem"];
+        bool success = await Travel(username, destinationSystem);
+        string response = success ? "TRAVEL_SUCCESS" : "TRAVEL_FAILED";
+
+        Log(success ? $"Player {username} traveled to {destinationSystem}" : $"Travel failed for player {username} to {destinationSystem}", success ? ConsoleColor.Cyan : ConsoleColor.Red);
+        return response;
+    }
+
+    private async Task<string> HandleGetCurrentSystem(string username)
+    {
+        if (string.IsNullOrWhiteSpace(username))
+            return "Invalid parameters for GET_CURRENT_SYSTEM";
+
+        string response = await GetCurrentSystem(username);
+
+        Log($"Current system for player {username} requested: {response}", ConsoleColor.Blue);
+        return response;
+    }
+
+    private async Task<bool> RegisterPlayer(string username, string password)
+    {
+        using (SQLiteCommand command = new SQLiteCommand("INSERT INTO Players (Username, Password, CurrentSystemId) VALUES (@Username, @Password, '1')", dbConnection))
+        {
+            command.Parameters.AddWithValue("@Username", username);
+            command.Parameters.AddWithValue("@Password", password);
+            try
+            {
+                await command.ExecuteNonQueryAsync();
+                return true;
+            }
+            catch (SQLiteException)
+            {
+                return false;
+            }
+        }
+    }
+
+    private async Task<bool> LoginPlayer(string username, string password)
+    {
+        using (SQLiteCommand command = new SQLiteCommand("SELECT * FROM Players WHERE Username = @Username AND Password = @Password", dbConnection))
+        {
+            command.Parameters.AddWithValue("@Username", username);
+            command.Parameters.AddWithValue("@Password", password);
+            using (var reader = (SQLiteDataReader)await command.ExecuteReaderAsync())
+            {
+                if (await reader.ReadAsync())
+                {
+                    lock (lockObj)
+                    {
+                        loggedInPlayerCount++;
+                    }
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private void LogoutPlayer(string username)
+    {
+        lock (lockObj)
+        {
+            loggedInPlayerCount = Math.Max(0, loggedInPlayerCount - 1);
+        }
+    }
+
+    private async Task<string> GetConnectedSystems(string currentSystem)
+    {
+        using (SQLiteCommand command = new SQLiteCommand("SELECT ConnectedSystems FROM Systems WHERE Name = @Name", dbConnection))
+        {
+            command.Parameters.AddWithValue("@Name", currentSystem);
+            using (var reader = (SQLiteDataReader)await command.ExecuteReaderAsync())
+            {
+                if (await reader.ReadAsync())
+                {
+                    return reader.GetString(0);
+                }
+            }
+        }
+        return "No connected systems found.";
+    }
+
+    private async Task<bool> Travel(string username, string destinationSystem)
+    {
+        using (SQLiteCommand command = new SQLiteCommand("UPDATE Players SET CurrentSystemId = (SELECT Id FROM Systems WHERE Name = @Destination) WHERE Username = @Username", dbConnection))
+        {
+            command.Parameters.AddWithValue("@Destination", destinationSystem);
+            command.Parameters.AddWithValue("@Username", username);
+            int rowsAffected = await command.ExecuteNonQueryAsync();
+            return rowsAffected > 0;
+        }
+    }
+
+    private async Task<string> GetCurrentSystem(string username)
+    {
+        using (SQLiteCommand command = new SQLiteCommand("SELECT Name FROM Systems WHERE Id = (SELECT CurrentSystemId FROM Players WHERE Username = @Username)", dbConnection))
+        {
+            command.Parameters.AddWithValue("@Username", username);
+            using (var reader = (SQLiteDataReader)await command.ExecuteReaderAsync())
+            {
+                if (await reader.ReadAsync())
+                {
+                    return reader.GetString(0);
+                }
+            }
+        }
+        return "Current system not found.";
+    }
+
+    private Dictionary<string, string> ParseRequestBody(string requestBody)
+    {
+        Dictionary<string, string> parameters = new Dictionary<string, string>();
+        string[] pairs = requestBody.Split('&');
+        foreach (string pair in pairs)
+        {
+            string[] kvp = pair.Split('=');
+            if (kvp.Length == 2)
+            {
+                parameters[Uri.UnescapeDataString(kvp[0])] = Uri.UnescapeDataString(kvp[1]);
+            }
+        }
+        return parameters;
+    }
+
+    private void Log(string message, ConsoleColor color = ConsoleColor.White)
+    {
+        Console.ForegroundColor = color;
+        Console.WriteLine(message);
+        Console.ResetColor();
+    }
+
+    private void DisplayBackendStatus()
+    {
+        Log("Backend server status:", ConsoleColor.Green);
+        Log($"- IP Address: {localIpAddress}", ConsoleColor.Green);
+        Log($"- Port: {port}", ConsoleColor.Green);
+        Log($"- HTTP URL: {httpUrl}", ConsoleColor.Green);
+    }
+}
+
+public class Program
+{
+    public static async Task Main(string[] args)
+    {
+        BackendServer server = new BackendServer();
+        await server.Start();
+    }
+}

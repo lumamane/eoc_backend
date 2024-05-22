@@ -1,0 +1,335 @@
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Data.SQLite;
+using System.Text;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using System.Data.Common;
+
+public class BackendServer
+{
+    private readonly IPAddress localIpAddress = IPAddress.Parse("127.0.0.1");
+    private readonly int port = 3000;
+    private SQLiteConnection dbConnection;
+    private int loggedInPlayerCount = 0;
+    private static readonly object lockObj = new object();
+
+    public BackendServer()
+    {
+        DisplayBackendStatus();
+        InitializeDatabase();
+    }
+
+    private void InitializeDatabase()
+    {
+        try
+        {
+            dbConnection = new SQLiteConnection("Data Source=eoc.db;Version=3;");
+            dbConnection.Open();
+        }
+        catch (Exception ex)
+        {
+            Log($"Error initializing database: {ex.Message}", ConsoleColor.Red);
+            Environment.Exit(1);
+        }
+    }
+
+    public async Task Start()
+    {
+        TcpListener listener = new TcpListener(localIpAddress, port);
+        listener.Start();
+        Log("Server started. Waiting for connections...", ConsoleColor.Cyan);
+
+        while (true)
+        {
+            TcpClient client = await listener.AcceptTcpClientAsync();
+            Log("Client connected.", ConsoleColor.Cyan);
+            _ = HandleClientAsync(client);
+        }
+    }
+
+    private async Task HandleClientAsync(TcpClient client)
+    {
+        using (client)
+        {
+            NetworkStream stream = client.GetStream();
+            byte[] buffer = new byte[1024];
+            int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+            string request = Encoding.ASCII.GetString(buffer, 0, bytesRead);
+
+            string[] parts = request.Split('|');
+            string response = parts.Length > 0 ? await ProcessRequest(parts) : "UNKNOWN_COMMAND";
+
+            byte[] responseData = Encoding.ASCII.GetBytes(response);
+            await stream.WriteAsync(responseData, 0, responseData.Length);
+        }
+    }
+
+    private async Task<string> ProcessRequest(string[] parts)
+    {
+        string response;
+        switch (parts[0])
+        {
+            case "REGISTER":
+                response = await HandleRegister(parts);
+                break;
+
+            case "LOGIN":
+                response = await HandleLogin(parts);
+                break;
+
+            case "LOGOUT":
+                response = HandleLogout(parts);
+                break;
+
+            case "GET_CONNECTED_SYSTEMS":
+                response = await HandleGetConnectedSystems(parts);
+                break;
+
+            case "TRAVEL":
+                response = await HandleTravel(parts);
+                break;
+
+            case "GET_CURRENT_SYSTEM":
+                response = await HandleGetCurrentSystem(parts);
+                break;
+
+            default:
+                response = "UNKNOWN_COMMAND";
+                Log("Unknown command received.", ConsoleColor.Magenta);
+                break;
+        }
+
+        return response;
+    }
+
+    private async Task<string> HandleRegister(string[] parameters)
+    {
+        if (parameters.Length < 3)
+            return "Invalid parameters for REGISTER";
+
+        string username = parameters[1];
+        string password = parameters[2];
+        bool success = await RegisterPlayer(username, password);
+        string response = success ? "Registration successful." : "Registration failed. Username may already be taken.";
+
+        Log(success ? $"Player registered: {username}" : $"Registration failed for: {username}", success ? ConsoleColor.Green : ConsoleColor.Red);
+
+        if (success)
+            await Travel(username, "Jita");
+
+        return response;
+    }
+
+    private async Task<string> HandleLogin(string[] parameters)
+    {
+        if (parameters.Length < 3)
+            return "Invalid parameters for LOGIN";
+
+        string username = parameters[1];
+        string password = parameters[2];
+        bool success = await LoginPlayer(username, password);
+        string response = success ? "LOGIN_SUCCESS" : "LOGIN_FAILED";
+
+        Log(success ? $"Player logged in: {username}" : $"Login failed for: {username}", success ? ConsoleColor.Green : ConsoleColor.Red);
+
+        return response;
+    }
+
+    private string HandleLogout(string[] parts)
+    {
+        if (parts.Length < 2)
+            return "Invalid parameters for LOGOUT";
+
+        string username = parts[1];
+        LogoutPlayer(username);
+        Log($"Player logged out: {username}", ConsoleColor.Yellow);
+        return "LOGOUT_SUCCESS";
+    }
+
+    private async Task<string> HandleGetConnectedSystems(string[] parts)
+    {
+        if (parts.Length < 2)
+            return "Invalid parameters for GET_CONNECTED_SYSTEMS";
+
+        string currentSystem = parts[1];
+        string response = await GetConnectedSystems(currentSystem);
+
+        Log($"Connected systems for {currentSystem} requested:\n{response}", ConsoleColor.Blue);
+        return response;
+    }
+
+    private async Task<string> HandleTravel(string[] parts)
+    {
+        if (parts.Length < 3)
+            return "Invalid parameters for TRAVEL";
+
+        string username = parts[1];
+        string destinationSystem = parts[2];
+        bool success = await Travel(username, destinationSystem);
+        string response = success ? "TRAVEL_SUCCESS" : "TRAVEL_FAILED";
+
+        Log(success ? $"Player {username} traveled to {destinationSystem}" : $"Travel failed for player {username} to {destinationSystem}", success ? ConsoleColor.Cyan : ConsoleColor.Red);
+        return response;
+    }
+
+    private async Task<string> HandleGetCurrentSystem(string[] parts)
+    {
+        if (parts.Length < 2)
+            return "Invalid parameters for GET_CURRENT_SYSTEM";
+
+        string username = parts[1];
+        string response = await GetCurrentSystem(username);
+
+        Log($"Current system for player {username} requested: {response}", ConsoleColor.Blue);
+        return response;
+    }
+
+    private async Task<bool> RegisterPlayer(string username, string password)
+    {
+        using (SQLiteCommand command = new SQLiteCommand("INSERT INTO Players (Username, Password, CurrentSystemId) VALUES (@Username, @Password, '1')", dbConnection))
+        {
+            command.Parameters.AddWithValue("@Username", username);
+            command.Parameters.AddWithValue("@Password", password);
+            try
+            {
+                await command.ExecuteNonQueryAsync();
+                return true;
+            }
+            catch (SQLiteException)
+            {
+                return false;
+            }
+        }
+    }
+
+    private async Task<bool> LoginPlayer(string username, string password)
+    {
+        using (SQLiteCommand command = new SQLiteCommand("SELECT * FROM Players WHERE Username = @Username AND Password = @Password", dbConnection))
+        {
+            command.Parameters.AddWithValue("@Username", username);
+            command.Parameters.AddWithValue("@Password", password);
+            using (DbDataReader reader = await command.ExecuteReaderAsync())
+            {
+                if (await reader.ReadAsync())
+                {
+                    lock (lockObj)
+                    {
+                        loggedInPlayerCount++;
+                    }
+                    return true;
+                }
+                return false;
+            }
+        }
+    }
+
+    private void LogoutPlayer(string username)
+    {
+        lock (lockObj)
+        {
+            loggedInPlayerCount--;
+        }
+    }
+
+    private async Task<string> GetConnectedSystems(string currentSystem)
+    {
+        int systemId = await GetSystemId(currentSystem);
+        List<string> connectedSystems = new List<string>();
+
+        if (systemId != -1)
+        {
+            using (SQLiteCommand command = new SQLiteCommand(
+                @"SELECT sc.Name FROM Systems2 s
+                JOIN GameWorld2 gw ON s.Id = gw.SystemId
+                JOIN Systems2 sc ON gw.ConnectedSystemId = sc.Id
+                WHERE s.Id = @SystemId", dbConnection))
+            {
+                command.Parameters.AddWithValue("@SystemId", systemId);
+                using (DbDataReader reader = await command.ExecuteReaderAsync())
+                {
+                    while (await reader.ReadAsync())
+                    {
+                        connectedSystems.Add(reader["Name"].ToString());
+                    }
+                }
+            }
+        }
+
+        return string.Join(",", connectedSystems);
+    }
+
+    private async Task<bool> Travel(string username, string destinationSystem)
+    {
+        int destinationSystemId = await GetSystemId(destinationSystem);
+
+        if (await SystemExists(destinationSystem))
+        {
+            using (SQLiteCommand command = new SQLiteCommand("UPDATE Players SET CurrentSystemId = @CurrentSystemId WHERE Username = @Username", dbConnection))
+            {
+                command.Parameters.AddWithValue("@CurrentSystemId", destinationSystemId);
+                command.Parameters.AddWithValue("@Username", username);
+                await command.ExecuteNonQueryAsync();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private async Task<string> GetCurrentSystem(string username)
+    {
+        using (SQLiteCommand command = new SQLiteCommand(
+            @"SELECT s.Name from Players p JOIN Systems2 s ON p.CurrentSystemId = s.Id WHERE Username = @Username", dbConnection))
+        {
+            command.Parameters.AddWithValue("@Username", username);
+            return (await command.ExecuteScalarAsync())?.ToString() ?? "UNKNOWN";
+        }
+    }
+
+    private async Task<int> GetSystemId(string systemName)
+    {
+        using (SQLiteCommand command = new SQLiteCommand("SELECT Id FROM Systems2 WHERE Name = @Name", dbConnection))
+        {
+            command.Parameters.AddWithValue("@Name", systemName);
+            var result = await command.ExecuteScalarAsync();
+            return result != null ? Convert.ToInt32(result) : -1;
+        }
+    }
+
+    private async Task<bool> SystemExists(string systemName)
+    {
+        using (SQLiteCommand command = new SQLiteCommand("SELECT COUNT(*) FROM Systems2 WHERE Name = @Name", dbConnection))
+        {
+            command.Parameters.AddWithValue("@Name", systemName);
+            int count = Convert.ToInt32(await command.ExecuteScalarAsync());
+            return count > 0;
+        }
+    }
+
+    private string GetCurrentTimestamp()
+    {
+        return DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+    }
+
+    private void DisplayBackendStatus()
+    {
+        Log("===== EOC Backend Server ==================", ConsoleColor.Cyan);
+        Log($"Server IP: {localIpAddress}", ConsoleColor.Cyan);
+        Log($"Server Port: {port}", ConsoleColor.Cyan);
+        Log("===========================================", ConsoleColor.Cyan);
+    }
+
+    private void Log(string message, ConsoleColor color)
+    {
+        Console.ForegroundColor = color;
+        Console.WriteLine($"{GetCurrentTimestamp()} {message}");
+        Console.ResetColor();
+    }
+
+    public static void Main()
+    {
+        BackendServer server = new BackendServer();
+        server.Start().GetAwaiter().GetResult();
+    }
+}
